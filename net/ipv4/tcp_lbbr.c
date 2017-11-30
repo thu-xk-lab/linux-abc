@@ -228,7 +228,7 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		lbbr->ssthresh = max(tp->snd_cwnd >> 1U, 2U);
 	}
 
-	target_cwnd = lbbr_target_cwnd(sk, bw, lbbr->cwnd_gain, lbbr_max_rtt_inc_us);
+	target_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, lbbr_max_rtt_inc_us);
 
 	if (lbbr->mode == LBBR_INCREASE) {
 		tp->snd_cwnd_cnt += acked;
@@ -350,7 +350,7 @@ static size_t lbbr_get_info(struct sock *sk, u32 ext, int *attr,
 		info->lbbr.lbbr_bw_hi		= (u32)(bw >> 32);
 		info->lbbr.lbbr_min_rtt 	= lbbr_min_rtt(sk);
 		info->lbbr.lbbr_ssthresh 	= lbbr->ssthresh;
-		info->lbbr.lbbr_target_cwnd	= lbbr_target_cwnd(sk, lbbr_max_bw(sk), LBBR_UNIT);
+		info->lbbr.lbbr_target_cwnd	= lbbr_target_cwnd(sk, lbbr_max_bw(sk), LBBR_UNIT, lbbr_max_rtt_inc_us);
 
 		*attr = INET_DIAG_LBBRINFO;
 		return sizeof(info->lbbr);
