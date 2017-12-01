@@ -211,7 +211,7 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct lbbr *lbbr = inet_csk_ca(sk);
-	u32 cwnd = 0, target_cwnd = 0, delta;
+	u32 cwnd = 0, target_cwnd = 0, upper_cwnd = 0, delta;
 
 	if (!acked)
 		return;
@@ -228,7 +228,8 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		lbbr->ssthresh = max(tp->snd_cwnd >> 1U, 2U);
 	}
 
-	target_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, lbbr_max_rtt_inc_us);
+	target_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, 0);
+	upper_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, lbbr_max_rtt_inc_us);
 
 	if (lbbr->mode == LBBR_INCREASE) {
 		tp->snd_cwnd_cnt += acked;
@@ -237,9 +238,9 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		tp->snd_cwnd += delta;
 		tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
 
-		if (tp->snd_cwnd > target_cwnd) {
+		if (tp->snd_cwnd > upper_cwnd) {
 			lbbr->mode = LBBR_DECREASE;
-			lbbr->prev_cwnd = target_cwnd >> 1;
+			lbbr->prev_cwnd = target_cwnd;
 			lbbr->cur_cnt = 0;
 		}
 	}
