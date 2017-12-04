@@ -59,6 +59,8 @@ static const u32 lbbr_cwnd_min_target = 4;
 static const u32 lbbr_alpha = 8;
 /* We can only tolerate 5ms */
 static const u32 lbbr_max_rtt_inc_us = 5000;
+/* Max released time */
+static const u32 lbbr_max_rtt_dec_us = 5000;
 
 static bool lbbr_full_bw_reached(const struct sock *sk)
 {
@@ -211,7 +213,7 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct lbbr *lbbr = inet_csk_ca(sk);
-	u32 cwnd = 0, target_cwnd = 0, upper_cwnd = 0, delta;
+	u32 cwnd = 0, target_cwnd = 0, upper_cwnd = 0, lower_cwnd, delta, release_rtt_us;
 
 	if (!acked)
 		return;
@@ -219,7 +221,7 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
 
 	if (!lbbr_full_bw_reached(sk)) {
-		tp->snd_cwnd = lbbr_target_cwnd(sk, bw, lbbr->cwnd_gain, 0);
+		tp->snd_cwnd = lbbr_target_cwnd(sk, bw, lbbr_startup_gain, 0);
 		return;
 	}
 
@@ -232,6 +234,9 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 	upper_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, lbbr_max_rtt_inc_us);
 
 	if (lbbr->mode == LBBR_INCREASE) {
+		if (tp->snd_cwnd < target_cwnd)
+			tp->snd_cwnd = min(target_cwnd, tp->snd_cwnd_clamp);
+
 		tp->snd_cwnd_cnt += acked;
 		delta = tp->snd_cwnd_cnt / tp->snd_cwnd;
 		tp->snd_cwnd_cnt -= delta * tp->snd_cwnd;
@@ -239,8 +244,11 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
 
 		if (tp->snd_cwnd > upper_cwnd) {
+			release_rtt_us = min(lbbr->min_rtt_us, lbbr_max_rtt_dec_us);
+			lower_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, -release_rtt_us);
+
 			lbbr->mode = LBBR_DECREASE;
-			lbbr->prev_cwnd = target_cwnd;
+			lbbr->prev_cwnd = lower_cwnd;
 			lbbr->cur_cnt = 0;
 		}
 	}
