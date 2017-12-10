@@ -18,7 +18,7 @@ enum lbbr_mode {
 struct lbbr {
 	u32	min_rtt_us;		/* Min round trip time */
 	u32	min_rtt_stamp;		/* Timestamp of min_rtt_us */
-	struct minmax bw;		/* Max recent delivery rate in pkt/usec << 24 */ 
+	struct minmax bw;		/* Max recent delivery rate in pkt/usec << 24 */
 	u32	max_bw;			/* Max recent delivery rate in pkt/usec << 24 */
 	u32	ssthresh;		/* ssthresh to start cong_avoid */
 	u32	next_rtt_delivered;	/* scb->tx.delivered at end of round */
@@ -26,10 +26,11 @@ struct lbbr {
 	u32	full_bw;		/* recent bw, to estimate if pipe is full */
 	u32	prev_cwnd;		/* previous cwnd */
 	u32	full_bw_count:3,	/* number of rounds without large bw gains */
+		pacing_gain:10,
 		cwnd_gain:10,		/* current gain for setting cwnd */
-		mode:3,			/* current mode */
-		cur_cnt:10,		/* current offset */
-		unused:6;
+		cur_cnt:8,		/* current offset */
+		has_seen_rtt:1;		/* have we seen an RTT sample yet ? */
+	u32	mode;
 };
 
 /* Window length of bw filter (in rounds): */
@@ -40,7 +41,7 @@ static const u32 lbbr_min_rtt_with_sec = 10;
 static const u32 lbbr_probe_rtt_mode_ms = 200;
 
 /* The gain for startup phase */
-static const int lbbr_startup_gain = LBBR_UNIT * 2884 / 1000;
+static const int lbbr_startup_gain = LBBR_UNIT * 2885 / 1000 + 1;
 /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
 static const int lbbr_cwnd_gain = LBBR_UNIT * 2;
 
@@ -73,8 +74,8 @@ static u32 lbbr_max_bw(struct sock *sk)
 {
 	const struct lbbr *lbbr = inet_csk_ca(sk);
 
-	return minmax_get(&lbbr->bw);
-	//	return lbbr->max_bw;
+	//	return minmax_get(&lbbr->bw);
+	return lbbr->max_bw;
 }
 
 static u32 lbbr_min_rtt(struct sock *sk)
@@ -111,7 +112,47 @@ static u32 lbbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 	return rate >> BW_SCALE;
 }
 
-static u32 lbbr_target_cwnd(struct sock *sk, u32 bw, int gain, int rtt_tol_us)
+static u32 lbbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
+{
+	u64 rate = bw;
+
+	rate = lbbr_rate_bytes_per_sec(sk, rate, gain);
+	rate = min_t(u64, rate, sk->sk_max_pacing_rate);
+	return rate;
+}
+
+static void lbbr_init_pacing_rate_from_rtt(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct lbbr *lbbr = inet_csk_ca(sk);
+	u64 bw;
+	u32 rtt_us;
+
+	if (tp->srtt_us) {
+		rtt_us = max(tp->srtt_us >> 3, 1U);
+		lbbr->has_seen_rtt = 1;
+	} else {
+		rtt_us = USEC_PER_MSEC;
+	}
+
+	bw = (u64)tp->snd_cwnd * BW_UNIT;
+	do_div(bw, rtt_us);
+	sk->sk_pacing_rate = lbbr_bw_to_pacing_rate(sk, bw, lbbr_startup_gain);
+}
+
+static void lbbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct lbbr *lbbr = inet_csk_ca(sk);
+	u32 rate = lbbr_bw_to_pacing_rate(sk, bw, gain);
+
+	if (unlikely(!lbbr->has_seen_rtt && tp->srtt_us))
+		lbbr_init_pacing_rate_from_rtt(sk);
+	if (lbbr_full_bw_reached(sk) || rate > sk->sk_pacing_rate)
+		sk->sk_pacing_rate = rate;
+}
+
+static u32 lbbr_target_cwnd(struct sock *sk, u32 bw, int gain)
 {
 	struct lbbr *lbbr = inet_csk_ca(sk);
 	u32 cwnd;
@@ -120,7 +161,7 @@ static u32 lbbr_target_cwnd(struct sock *sk, u32 bw, int gain, int rtt_tol_us)
 	if (unlikely(lbbr->min_rtt_us == ~0U))	/* no valid RTT sample yet? */
 		return TCP_INIT_CWND;		/* cap at default initial cwnd */
 
-	w = (u64)bw * (lbbr->min_rtt_us + rtt_tol_us);
+	w = (u64)bw * lbbr->min_rtt_us;
 
 	/* Apply a gain to the given value, then remove the BW_SCALE shift. */
 	cwnd = (((w * gain) >> LBBR_SCALE) + BW_UNIT - 1) >> BW_SCALE;
@@ -175,45 +216,12 @@ static u32 lbbr_slow_start(struct sock *sk, u32 acked)
 	return acked;
 }
 
-static void lbbr_cong_avoid_ai(struct tcp_sock *tp, u32 w, u32 acked)
-{
-	if (tp->snd_cwnd_cnt >= w) {
-		tp->snd_cwnd_cnt = 0;
-		tp->snd_cwnd++;
-	}
-
-	tp->snd_cwnd_cnt += acked;
-	if (tp->snd_cwnd_cnt >= w) {
-		u32 delta = tp->snd_cwnd_cnt / w;
-
-		tp->snd_cwnd_cnt -= delta * w;
-		tp->snd_cwnd += delta;
-	}
-	tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
-}
-
-static void lbbr_cong_avoid(struct sock *sk, u32 acked)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-
-	if (!lbbr_is_cwnd_limited(sk))
-		return;
-
-	if (lbbr_in_slow_start(sk)) {
-		acked = lbbr_slow_start(sk, acked);
-		if (!acked)
-			return;
-	}
-
-	lbbr_cong_avoid_ai(tp, tp->snd_cwnd, acked);
-}
-
 static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 			  u32 acked, u32 bw, int gain)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct lbbr *lbbr = inet_csk_ca(sk);
-	u32 cwnd = 0, target_cwnd = 0, upper_cwnd = 0, lower_cwnd, delta, release_rtt_us;
+	u32 cwnd = 0, target_cwnd = 0, upper_cwnd = 0, lower_cwnd, delta;
 
 	if (!acked)
 		return;
@@ -221,19 +229,20 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
 
 	if (!lbbr_full_bw_reached(sk)) {
-		tp->snd_cwnd = lbbr_target_cwnd(sk, bw, lbbr_startup_gain, 0);
+		tp->snd_cwnd = lbbr_target_cwnd(sk, bw, lbbr_startup_gain);
 		return;
 	}
 
 	if (lbbr_in_first_slow_start(sk)) {
 		lbbr->cwnd_gain = lbbr_cwnd_gain;
+		lbbr->pacing_gain = lbbr_cwnd_gain;
 		lbbr->ssthresh = max(tp->snd_cwnd >> 1U, 2U);
 	}
 
-	target_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, 0);
-	upper_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, lbbr_max_rtt_inc_us);
-
 	if (lbbr->mode == LBBR_INCREASE) {
+		target_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT);
+		upper_cwnd = lbbr_target_cwnd(sk, bw, 2 * LBBR_UNIT);
+
 		if (tp->snd_cwnd < target_cwnd)
 			tp->snd_cwnd = min(target_cwnd, tp->snd_cwnd_clamp);
 
@@ -244,8 +253,7 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
 
 		if (tp->snd_cwnd > upper_cwnd) {
-			release_rtt_us = min(lbbr->min_rtt_us, lbbr_max_rtt_dec_us);
-			lower_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT, -release_rtt_us);
+			lower_cwnd = lbbr_target_cwnd(sk, bw, LBBR_UNIT * 80 / 100);
 
 			lbbr->mode = LBBR_DECREASE;
 			lbbr->prev_cwnd = lower_cwnd;
@@ -269,14 +277,6 @@ static void lbbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		if (tp->snd_cwnd <= lbbr->prev_cwnd)
 			lbbr->mode = LBBR_INCREASE;
 	}
-
-	/* if (tp->snd_cwnd > target_cwnd) { */
-	/* 	cwnd = min(tp->snd_cwnd, target_cwnd); */
-	/* 	lbbr->ssthresh = max(cwnd >> 1U, 2U); */
-	/* 	tp->snd_cwnd = min(lbbr->ssthresh, tp->snd_cwnd_clamp); */
-	/* } else { */
-	/* 	lbbr_cong_avoid(sk, acked); */
-	/* } */
 }
 
 static void lbbr_update_max_bw(struct sock *sk, const struct rate_sample *rs)
@@ -297,7 +297,10 @@ static void lbbr_update_max_bw(struct sock *sk, const struct rate_sample *rs)
 		minmax_running_max(&lbbr->bw, lbbr_bw_rtts, lbbr->rtt_cnt, bw);
 	}
 
-	lbbr->max_bw = lbbr->max_bw * (lbbr_alpha - 1) / lbbr_alpha + bw / lbbr_alpha;
+	if (!lbbr->max_bw && bw)
+		lbbr->max_bw = bw;
+	else
+		lbbr->max_bw = lbbr->max_bw * (lbbr_alpha - 1) / lbbr_alpha + bw / lbbr_alpha;
 }
 
 static void lbbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
@@ -325,8 +328,10 @@ static void lbbr_update_model(struct sock *sk, const struct rate_sample *rs)
 static void lbbr_main(struct sock *sk, const struct rate_sample *rs)
 {
 	struct lbbr *lbbr = inet_csk_ca(sk);
+	u32 bw = lbbr_max_bw(sk);
 	
 	lbbr_update_model(sk, rs);
+	lbbr_set_pacing_rate(sk, bw, lbbr->pacing_gain);
 	lbbr_set_cwnd(sk, rs, rs->acked_sacked, lbbr_max_bw(sk), lbbr->cwnd_gain);
 }
 
@@ -359,7 +364,7 @@ static size_t lbbr_get_info(struct sock *sk, u32 ext, int *attr,
 		info->lbbr.lbbr_bw_hi		= (u32)(bw >> 32);
 		info->lbbr.lbbr_min_rtt 	= lbbr_min_rtt(sk);
 		info->lbbr.lbbr_ssthresh 	= lbbr->ssthresh;
-		info->lbbr.lbbr_target_cwnd	= lbbr_target_cwnd(sk, lbbr_max_bw(sk), LBBR_UNIT, lbbr_max_rtt_inc_us);
+		info->lbbr.lbbr_target_cwnd	= lbbr_target_cwnd(sk, lbbr_max_bw(sk), LBBR_UNIT);
 
 		*attr = INET_DIAG_LBBRINFO;
 		return sizeof(info->lbbr);
@@ -378,6 +383,7 @@ static void lbbr_init(struct sock *sk)
 	lbbr->min_rtt_us = tcp_min_rtt(tp);
 
 	lbbr->cwnd_gain = lbbr_startup_gain;
+	lbbr->pacing_gain = lbbr_startup_gain;
 
 	minmax_reset(&lbbr->bw, 0, 0);
 	lbbr->max_bw = 0;
@@ -389,6 +395,7 @@ static void lbbr_init(struct sock *sk)
 	lbbr->prev_cwnd = 0;
 	lbbr->mode = LBBR_INCREASE;
 	lbbr->cur_cnt = 0;
+	lbbr->has_seen_rtt = 0;
 }
 
 static struct tcp_congestion_ops tcp_lbbr_cong_ops __read_mostly = {
@@ -396,9 +403,7 @@ static struct tcp_congestion_ops tcp_lbbr_cong_ops __read_mostly = {
 	.name 		= "lbbr",
 	.owner 		= THIS_MODULE,
 	.init		= lbbr_init,
-	/* .ssthresh 	= tcp_reno_ssthresh, */
 	.ssthresh	= lbbr_ssthresh,
-	/* .cong_avoid	= tcp_reno_cong_avoid, */
 	.cong_control	= lbbr_main,
 	.get_info	= lbbr_get_info,
 };
